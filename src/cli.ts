@@ -17,6 +17,9 @@ import { buildAgentEnv, fetchModelIds, opencodeConfig, piModels, renderEnvFile }
 import { allocatePorts, type BoxRecord, type Config, ensureHome, findBox, loadConfig, loadSecrets, loadState, saveState } from "./state.ts";
 import { ensureServe, hubBaseUrl, hubDnsName, removeServe, serveStatus } from "./tailscale.ts";
 import { portOpen, TunnelManager } from "./tunnel.ts";
+import { DESCRIPTOR_PATH, WakeProxy } from "./wake-proxy.ts";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 const USAGE = `t3ih: T3 Code on InstaBox machines, reached through this hub
 
@@ -128,6 +131,19 @@ function route(c: Ctx, b: BoxRecord): string {
   return hubBaseUrl(hubDnsName(undefined, c.cfg.hubHost), b.servePort);
 }
 
+/**
+ * Idempotency-Key for creating `name`: a nonce stored until the create succeeds,
+ * so a retried attempt replays the same request, while re-creating the name after
+ * a delete is a new request (no 409 idempotency_conflict).
+ */
+export function createKey(c: { dir: string }, name: string): string {
+  const st = loadState(c.dir);
+  st.pendingCreates ??= {};
+  st.pendingCreates[name] ??= crypto.randomUUID();
+  saveState(st, c.dir);
+  return `t3ih-create-${name}-${st.pendingCreates[name]}`;
+}
+
 async function cmdCreate(c: Ctx, args: string[]) {
   const name = args[0];
   if (!name || !/^[a-z0-9][a-z0-9-]{0,62}$/.test(name)) throw new Error("name: 1-63 of a-z, 0-9 and -");
@@ -141,13 +157,16 @@ async function cmdCreate(c: Ctx, args: string[]) {
       autoSuspendAfterSeconds: c.cfg.autoSuspendAfterSeconds,
       metadata: { [OWNER_LABEL]: "1" },
     },
-    `t3ih-create-${name}`,
+    createKey(c, name),
   );
   if (!op.machineId) throw new Error("create returned no machine id");
   err(`creating ${name}…`);
   await c.api.waitOperation(op.id);
   const m = await c.api.waitRunning(op.machineId);
   const b = await register(c, m);
+  const st = loadState(c.dir);
+  delete st.pendingCreates?.[name];
+  saveState(st, c.dir);
   err(lastLine(await setup(c, m.id)));
   err(`route: ${route(c, b)} (forwarded by \`t3ih watch\`); pair with: t3ih pair ${name}`);
 }
@@ -165,8 +184,8 @@ async function cmdList(c: Ctx) {
   const rows: string[] = [];
   for (const b of Object.values(state.boxes)) {
     const m = await c.api.findMachine(b.id);
-    const tunnel = (await portOpen(b.localPort)) ? "up" : "down";
-    rows.push(`${b.name.padEnd(24)} ${(m?.state ?? "gone").padEnd(10)} tunnel=${tunnel} hub=127.0.0.1:${b.localPort}${c.cfg.tailscaleServe ? ` tailnet=:${b.servePort}` : ""}`);
+    const watch = (await portOpen(b.localPort)) ? "listening" : "not-running";
+    rows.push(`${b.name.padEnd(24)} ${(m?.state ?? "gone").padEnd(10)} watch=${watch} hub=127.0.0.1:${b.localPort}${c.cfg.tailscaleServe ? ` tailnet=:${b.servePort}` : ""}`);
   }
   process.stdout.write(rows.length ? `${rows.join("\n")}\n` : "no boxes (t3ih create <name>)\n");
 }
@@ -262,42 +281,152 @@ async function readStdin(): Promise<string> {
 
 async function cmdWatch(c: Ctx) {
   const log = (m: string) => process.stdout.write(`${new Date().toISOString()} ${m}\n`);
-  const tunnels = new TunnelManager(c.dir, log);
-  const stop = () => (tunnels.stopAll(), process.exit(0));
+  const sup = new Supervisor(c, log);
+  const stop = () => (sup.stopAll(), process.exit(0));
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
-  log(`watching ${Object.keys(loadState(c.dir).boxes).length} box(es), every ${c.cfg.pollSeconds} s`);
+  log(`watching ${Object.keys(loadState(c.dir).boxes).length} box(es), every ${c.cfg.pollSeconds} s; wake on use: ${c.cfg.wakeOnUse ? "on" : "off"}`);
   for (;;) {
-    for (const b of Object.values(loadState(c.dir).boxes)) {
-      try {
-        const m = await c.api.findMachine(b.id);
-        const action = plan(m, tunnels.healthy(b.id));
-        if (action === "forget") {
-          tunnels.forget(b.id);
-          if (c.cfg.tailscaleServe) removeServe(b.servePort, b.localPort);
-          const s = loadState(c.dir);
-          delete s.boxes[b.id];
-          saveState(s, c.dir);
-          log(`${b.name}: gone from InstaBox; route removed`);
-        } else if (action === "close" && tunnels.ids().includes(b.id)) {
-          tunnels.stop(b.id);
-          log(`${b.name}: ${m?.state}; tunnel closed`);
-        } else if (action === "open") {
-          const reopened = tunnels.ids().includes(b.id);
-          if (!reopened) {
-            // Coming back from a pause or stop (or first sight): fresh connections, env, loopback check.
-            log(`${b.name}: ${lastLine(await run(c, b.id, staleConnectionsScript(), { what: "stale connections" }))}`);
-            log(`${b.name}: ${await setup(c, b.id)}`);
-          }
-          await tunnels.open(c.api, b.id, b.localPort);
-          if (c.cfg.tailscaleServe) ensureServe(b.servePort, b.localPort);
-          log(`${b.name}: tunnel up on hub port ${b.localPort}${reopened ? " (renewed)" : ""}`);
-        }
-      } catch (e) {
-        log(`${b.name}: ${(e as Error).message}`);
+    await sup.poll();
+    await new Promise((r) => setTimeout(r, c.cfg.pollSeconds * 1000));
+  }
+}
+
+/**
+ * Per box: a wake proxy on the stable hub port, an ssh -L tunnel on an ephemeral
+ * port while the box runs, the tailnet route, and a cached descriptor. The poll
+ * loop and the proxy share `ensureUp`, one call at a time per box.
+ */
+export class Supervisor {
+  private readonly c: Ctx;
+  private readonly log: (m: string) => void;
+  private readonly tunnels: TunnelManager;
+  private readonly proxies = new Map<string, WakeProxy>();
+  private readonly pending = new Map<string, Promise<number>>();
+  private readonly descriptors = new Map<string, string>();
+  /** Boxes whose setup must run again before the next tunnel (first sight, or seen stopped: tmpfs env gone). */
+  private readonly needsSetup = new Set<string>();
+
+  constructor(c: Ctx, log: (m: string) => void) {
+    this.c = c;
+    this.log = log;
+    this.tunnels = new TunnelManager(c.dir, log);
+  }
+
+  stopAll() {
+    this.tunnels.stopAll();
+    for (const p of this.proxies.values()) void p.close();
+  }
+
+  private descriptorFile(id: string) {
+    return join(this.c.dir, "descriptors", `${id.replace(/[^A-Za-z0-9_-]/g, "_")}.json`);
+  }
+
+  private async ensureProxy(b: BoxRecord) {
+    if (this.proxies.has(b.id)) return;
+    try {
+      this.descriptors.set(b.id, readFileSync(this.descriptorFile(b.id), "utf8"));
+    } catch {}
+    this.needsSetup.add(b.id);
+    const proxy = new WakeProxy({
+      port: b.localPort,
+      upstream: () => this.tunnels.port(b.id),
+      wake: () => (this.c.cfg.wakeOnUse ? this.ensureUp(b, true) : Promise.reject(new Error("wakeOnUse is off"))),
+      descriptor: () => this.descriptors.get(b.id) ?? null,
+      log: (m) => this.log(`${b.name}: ${m}`),
+    });
+    await proxy.listen();
+    this.proxies.set(b.id, proxy);
+    if (this.c.cfg.tailscaleServe) ensureServe(b.servePort, b.localPort);
+  }
+
+  /** Box running and tunnel up; resolves to the tunnel port. `wake`: resume or start it if needed. */
+  ensureUp(b: BoxRecord, wake: boolean): Promise<number> {
+    const port = this.tunnels.port(b.id);
+    if (port !== null) return Promise.resolve(port);
+    let p = this.pending.get(b.id);
+    if (!p) {
+      p = this.bringUp(b, wake).finally(() => this.pending.delete(b.id));
+      this.pending.set(b.id, p);
+    }
+    return p;
+  }
+
+  private async bringUp(b: BoxRecord, wake: boolean): Promise<number> {
+    let m = await this.c.api.getMachine(b.id);
+    if (!isRunning(m)) {
+      if (!wake) throw new Error(`box is ${m.state}`);
+      if (m.state === "suspended" || m.state === "stopped") {
+        if (m.state === "stopped") this.needsSetup.add(b.id);
+        this.log(`${b.name}: ${m.state}; waking for a session`);
+        const op = await this.c.api.lifecycle(b.id, m.state === "stopped" ? "start" : "resume");
+        await this.c.api.waitOperation(op.id, 3 * 60_000);
+      }
+      m = await this.c.api.waitRunning(b.id, 3 * 60_000);
+    }
+    const fresh = !this.tunnels.ids().includes(b.id);
+    if (fresh) {
+      // Back from a pause or stop, or first sight: close dead outbound sockets; redo setup only when needed.
+      this.log(`${b.name}: ${lastLine(await run(this.c, b.id, staleConnectionsScript(), { what: "stale connections" }))}`);
+      if (this.needsSetup.has(b.id)) {
+        this.log(`${b.name}: ${await setup(this.c, b.id)}`);
+        this.needsSetup.delete(b.id);
       }
     }
-    await new Promise((r) => setTimeout(r, c.cfg.pollSeconds * 1000));
+    const port = await this.tunnels.open(this.c.api, b.id);
+    this.log(`${b.name}: tunnel up${fresh ? "" : " (renewed)"}`);
+    await this.cacheDescriptor(b, port);
+    return port;
+  }
+
+  private async cacheDescriptor(b: BoxRecord, port: number) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}${DESCRIPTOR_PATH}`, { signal: AbortSignal.timeout(5000) });
+      const text = await res.text();
+      if (!res.ok || typeof JSON.parse(text).environmentId !== "string") return;
+      this.descriptors.set(b.id, text);
+      mkdirSync(join(this.c.dir, "descriptors"), { recursive: true, mode: 0o700 });
+      writeFileSync(this.descriptorFile(b.id), text, { mode: 0o600 });
+    } catch {}
+  }
+
+  async poll() {
+    const boxes = loadState(this.c.dir).boxes;
+    for (const [id, p] of this.proxies) {
+      if (!boxes[id]) {
+        void p.close();
+        this.proxies.delete(id);
+        this.tunnels.forget(id);
+      }
+    }
+    for (const b of Object.values(boxes)) {
+      try {
+        await this.ensureProxy(b);
+        const m = await this.c.api.findMachine(b.id);
+        const action = plan(m, this.tunnels.healthy(b.id));
+        if (action === "forget") {
+          this.tunnels.forget(b.id);
+          await this.proxies.get(b.id)?.close();
+          this.proxies.delete(b.id);
+          if (this.c.cfg.tailscaleServe) removeServe(b.servePort, b.localPort);
+          rmSync(this.descriptorFile(b.id), { force: true });
+          const s = loadState(this.c.dir);
+          delete s.boxes[b.id];
+          saveState(s, this.c.dir);
+          this.log(`${b.name}: gone from InstaBox; route removed`);
+        } else if (action === "close") {
+          if (m?.state === "stopped") this.needsSetup.add(b.id);
+          if (this.tunnels.ids().includes(b.id)) {
+            this.tunnels.stop(b.id);
+            this.log(`${b.name}: ${m?.state}; tunnel closed${this.c.cfg.wakeOnUse ? ", waking on the next session" : ""}`);
+          }
+        } else if (action === "open") {
+          await this.ensureUp(b, false);
+        }
+      } catch (e) {
+        this.log(`${b.name}: ${(e as Error).message}`);
+      }
+    }
   }
 }
 

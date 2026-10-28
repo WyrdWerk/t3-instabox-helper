@@ -2,8 +2,8 @@
 // through InstaBox's SSH gateway with a certificate from POST /connections.
 // Local forwarding only, so no chisel (bb-plugin-instabox needed it for -R).
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { connect } from "node:net";
+import { chmodSync, existsSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { connect, createServer } from "node:net";
 import { join } from "node:path";
 import { BOX_T3_PORT } from "./box-scripts.ts";
 import type { InstaboxApi, SshConnection } from "./instabox-api.ts";
@@ -61,8 +61,18 @@ export class TunnelManager {
     return [...this.tunnels.keys()];
   }
 
-  /** Open (or reopen) the forward for a running box. POST /connections would resume an idle-paused box, so only call this for running ones. */
-  async open(api: InstaboxApi, id: string, localPort: number): Promise<void> {
+  /** The hub loopback port this box's ssh -L listens on, while the tunnel is healthy. */
+  port(id: string): number | null {
+    return this.healthy(id) ? this.tunnels.get(id)!.localPort : null;
+  }
+
+  /**
+   * Open (or reopen) the forward for a running box on a free ephemeral hub port
+   * (the box's stable hub port belongs to the wake proxy). POST /connections
+   * would resume an idle-paused box, so only call this for running ones.
+   */
+  async open(api: InstaboxApi, id: string): Promise<number> {
+    const localPort = await freePort();
     this.stop(id);
     const key = this.keyPair();
     const conn = await api.sshConnection(id, key.publicKey, CERT_TTL_SECONDS);
@@ -82,6 +92,7 @@ export class TunnelManager {
       if (!t.stopping) this.log(`tunnel ${id}: ssh exited (${sig ?? code}): ${tail.trim().split("\n").pop()?.replace(/\d+\.\d+\.\d+\.\d+|\[[^\]]+\]|\S+\.\S+\.\S+/g, "<host>") ?? ""}`);
     });
     await waitForPort(localPort, 20_000);
+    return localPort;
   }
 
   stop(id: string): void {
@@ -112,12 +123,17 @@ export class TunnelManager {
       const r = spawnSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-C", "t3-instabox-helper", "-f", path], { stdio: "ignore" });
       if (r.status !== 0) throw new Error("ssh-keygen failed (is OpenSSH installed on the hub?)");
     }
+    // Inherited default ACLs can leave the key group/world readable; ssh then ignores it.
+    chmodSync(join(this.dir, "ssh"), 0o700);
+    chmodSync(path, 0o600);
+    if ((statSync(path).mode & 0o077) !== 0) throw new Error(`${path} is not private (mode ${(statSync(path).mode & 0o777).toString(8)}); check default ACLs on ${this.dir}`);
     return { path, publicKey: readFileSync(`${path}.pub`, "utf8").trim() };
   }
 }
 
 function writePrivate(path: string, content: string) {
   writeFileSync(`${path}.tmp`, content, { mode: 0o600 });
+  chmodSync(`${path}.tmp`, 0o600);
   renameSync(`${path}.tmp`, path);
 }
 
@@ -126,6 +142,17 @@ export async function portOpen(port: number): Promise<boolean> {
     const c = connect(port, "127.0.0.1");
     c.once("connect", () => (c.destroy(), resolve(true)));
     c.once("error", () => resolve(false));
+  });
+}
+
+function freePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const s = createServer();
+    s.on("error", reject);
+    s.listen(0, "127.0.0.1", () => {
+      const a = s.address();
+      s.close(() => (a && typeof a === "object" ? resolve(a.port) : reject(new Error("no free port"))));
+    });
   });
 }
 

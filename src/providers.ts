@@ -24,7 +24,7 @@ export const DEFAULT_PROVIDERS: Provider[] = [
 
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** Never forwarded to a box: the hub's own credentials. */
-const HUB_ONLY = new Set(["INSTABOX_API_KEY", "INSTABOX_API_KEY_WYRD1"]);
+const HUB_ONLY = new Set(["INSTABOX_API_KEY", "INSTABOX_API_KEY_WYRD1", "T3IH_INSTABOX_API_KEY"]);
 
 /** Parse and check a providers list from config.json. Missing: the defaults. */
 export function parseProviders(v: unknown): Provider[] {

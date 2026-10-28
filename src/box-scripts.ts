@@ -37,15 +37,31 @@ ExecStart=/bin/sh -c 'export PATH="$$HOME/.local/bin:/usr/local/bin:/usr/bin:/bi
 export function setupScript(): string {
   return `set -euo pipefail
 umask 077
-sudo -n systemctl cat ${T3_UNIT} >/dev/null 2>&1 || { echo "setup=failed reason=no-${T3_UNIT} (create boxes from the t3 template or a snapshot of one)"; exit 1; }
 work=$(mktemp -d "\${XDG_RUNTIME_DIR:-/tmp}/t3ih.XXXXXX"); trap 'rm -rf "$work"' EXIT
+installed=no
+export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
+if ! sudo -n systemctl cat ${T3_UNIT} >/dev/null 2>&1; then
+  # A box without the t3 template's unit (e.g. a plain login-free snapshot): install
+  # T3 stable with the official installer if needed and create the base unit.
+  command -v t3 >/dev/null 2>&1 || { curl -fsSL https://t3.codes/install.sh | sh >/dev/null 2>&1 || { echo "setup=failed reason=t3-install"; exit 1; }; }
+  command -v t3 >/dev/null 2>&1 || { echo "setup=failed reason=t3-not-on-path"; exit 1; }
+  sudo -n mkdir -p /data/workspace && sudo -n chown "$(id -u):$(id -g)" /data/workspace
+  printf '%s\\n' '# Written by t3-instabox-helper (base unit; the 20-t3-instabox-helper drop-in sets ExecStart).' \
+    '[Unit]' 'Description=T3 Code (t3-instabox-helper)' 'After=network-online.target' \
+    '[Service]' "User=$(id -u)" "Environment=HOME=$HOME" "Environment=XDG_RUNTIME_DIR=/run/user/$(id -u)" \
+    'WorkingDirectory=/data/workspace' 'ExecStart=/bin/false' 'Restart=on-failure' 'RestartSec=3' \
+    '[Install]' 'WantedBy=multi-user.target' > "$work/unit"
+  sudo -n install -m 644 -o root -g root "$work/unit" /etc/systemd/system/${T3_UNIT}
+  sudo -n systemctl daemon-reload
+  installed=yes
+fi
 cat > "$work/in.json"
 node -e '
 const fs = require("fs"), d = process.argv[1], j = JSON.parse(fs.readFileSync(d + "/in.json", "utf8"));
 for (const k of ["env", "opencode", "pi"]) fs.writeFileSync(d + "/" + k, j[k] || "", { mode: 0o600 });
 ' "$work"
 rm -f "$work/in.json"
-changed=no
+changed=$installed
 # 1. loopback-only drop-in
 want=$(cat <<'DROPIN'
 ${serveDropIn().trimEnd()}
@@ -89,7 +105,7 @@ for i in $(seq 1 60); do
     "") ;;
     "127.0.0.1:${BOX_T3_PORT} ")
       if curl -fsS -m 3 -o /dev/null http://127.0.0.1:${BOX_T3_PORT}/.well-known/t3/environment; then
-        echo "setup=ok changed=$changed vars=$vars opencode=$oc pi=$pi"; exit 0
+        echo "setup=ok changed=$changed t3-installed=$installed vars=$vars opencode=$oc pi=$pi"; exit 0
       fi ;;
     *) echo "setup=failed reason=not-loopback-only listen=[$addrs]"; exit 1 ;;
   esac

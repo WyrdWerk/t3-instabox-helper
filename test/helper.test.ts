@@ -164,3 +164,44 @@ test("API client: idempotency keys on mutations, none on exec/wake, retries only
   assert.equal(seen.filter((s) => s.url.endsWith("/stop")).length, 1, "non-retryable errors are not retried");
   assert.equal(argValue(["x", "--ttl", "1h"], "--ttl"), "1h");
 });
+
+test("InstaBox key precedence: dedicated var, then secrets.env, then shell; differing shell key warned", async () => {
+  const { mkdtempSync, writeFileSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { loadSecrets } = await import("../src/state.ts");
+  const dir = mkdtempSync(`${tmpdir()}/t3ih-`);
+  writeFileSync(`${dir}/secrets.env`, "INSTABOX_API_KEY=dummy-file\nZAI_API_KEY=z\n", { mode: 0o600 });
+  const warns: string[] = [];
+  const w = (m: string) => warns.push(m);
+  assert.equal(loadSecrets(dir, { INSTABOX_API_KEY: "dummy-shell" }, w).INSTABOX_API_KEY, "dummy-file");
+  assert.equal(warns.length, 1);
+  assert.ok(!warns[0].includes("dummy-"), "warning names sources, not keys");
+  assert.equal(loadSecrets(dir, { T3IH_INSTABOX_API_KEY: "dummy-dedicated", INSTABOX_API_KEY: "dummy-dedicated" }, w).INSTABOX_API_KEY, "dummy-dedicated");
+  assert.equal(warns.length, 1, "same key: no warning");
+  writeFileSync(`${dir}/secrets.env`, "ZAI_API_KEY=z\n", { mode: 0o600 });
+  assert.equal(loadSecrets(dir, { INSTABOX_API_KEY: "dummy-shell" }, w).INSTABOX_API_KEY, "dummy-shell");
+  (await import("node:fs")).chmodSync(`${dir}/secrets.env`, 0o644);
+  assert.throws(() => loadSecrets(dir, {}, w), /chmod 600/);
+});
+
+test("create idempotency key: stable across retries of one attempt, new after the attempt completes", async () => {
+  const { mkdtempSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { createKey } = await import("../src/cli.ts");
+  const { loadState, saveState } = await import("../src/state.ts");
+  const dir = mkdtempSync(`${tmpdir()}/t3ih-`);
+  const k1 = createKey({ dir }, "box1");
+  assert.equal(createKey({ dir }, "box1"), k1);
+  assert.notEqual(createKey({ dir }, "box2"), k1);
+  const st = loadState(dir);
+  delete st.pendingCreates!.box1; // what a successful create does
+  saveState(st, dir);
+  assert.notEqual(createKey({ dir }, "box1"), k1);
+});
+
+test("setup installs T3 and a base unit only when the unit is missing", () => {
+  const s = setupScript();
+  assert.match(s, /if ! sudo -n systemctl cat t3-instabox\.service/);
+  assert.match(s, /curl -fsSL https:\/\/t3\.codes\/install\.sh \| sh/);
+  assert.match(s, /\/etc\/systemd\/system\/t3-instabox\.service/);
+});

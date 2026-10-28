@@ -23,6 +23,8 @@ export interface Config {
   servePortRange: [number, number];
   /** Publish each box on the tailnet with `tailscale serve`. false: loopback only (tests, or SSH-forward to the hub yourself). */
   tailscaleServe: boolean;
+  /** Wake a paused or stopped box when a client asks for a session on its route (not for route probes). */
+  wakeOnUse: boolean;
   /** Hub MagicDNS name; default: from `tailscale status --json`. */
   hubHost?: string;
   /** Pairing link lifetime (t3 syntax: 5m, 1h). */
@@ -43,6 +45,8 @@ export interface BoxRecord {
 
 export interface State {
   boxes: Record<string, BoxRecord>;
+  /** Create attempts in flight, by box name: the Idempotency-Key nonce a retry must reuse. */
+  pendingCreates?: Record<string, string>;
 }
 
 export const DEFAULTS: Config = {
@@ -51,6 +55,7 @@ export const DEFAULTS: Config = {
   localPortRange: [47301, 47399],
   servePortRange: [8301, 8399],
   tailscaleServe: true,
+  wakeOnUse: true,
   pairTtl: "10m",
   providers: parseProviders(undefined),
   claudeVia: "none",
@@ -62,6 +67,7 @@ export const home = () => process.env.T3IH_HOME || join(homedir(), ".config", "t
 export function ensureHome(dir = home()): string {
   mkdirSync(join(dir, "ssh"), { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
+  chmodSync(join(dir, "ssh"), 0o700);
   return dir;
 }
 
@@ -78,15 +84,27 @@ function checkRange(r: unknown, what: string) {
   if (!Array.isArray(r) || r.length !== 2 || !r.every((n) => Number.isInteger(n) && n > 0 && n < 65536) || r[0] > r[1]) throw new Error(`${what}: [first, last] ports`);
 }
 
-/** secrets.env merged under the process env for INSTABOX_API_KEY. Refuses a group/world-readable file. */
-export function loadSecrets(dir = home()): Record<string, string> {
+/**
+ * secrets.env, plus the InstaBox key by explicit precedence:
+ *   1. T3IH_INSTABOX_API_KEY in the environment (dedicated to this helper),
+ *   2. INSTABOX_API_KEY in secrets.env,
+ *   3. INSTABOX_API_KEY in the environment, only when secrets.env has none.
+ * A shell-wide INSTABOX_API_KEY that differs from the chosen key is ignored with a warning.
+ * Refuses a group/world-readable secrets.env.
+ */
+export function loadSecrets(dir = home(), env: NodeJS.ProcessEnv = process.env, warn: (m: string) => void = (m) => void process.stderr.write(`${m}\n`)): Record<string, string> {
   const f = join(dir, "secrets.env");
   let secrets: Record<string, string> = {};
   if (existsSync(f)) {
     if ((statSync(f).mode & 0o077) !== 0) throw new Error(`${f} must be private: chmod 600 ${f}`);
     secrets = parseEnvFile(readFileSync(f, "utf8"));
   }
-  if (process.env.INSTABOX_API_KEY) secrets.INSTABOX_API_KEY = process.env.INSTABOX_API_KEY;
+  const chosen = env.T3IH_INSTABOX_API_KEY || secrets.INSTABOX_API_KEY || env.INSTABOX_API_KEY;
+  if (env.INSTABOX_API_KEY && chosen !== env.INSTABOX_API_KEY) {
+    warn(`t3ih: ignoring INSTABOX_API_KEY from the environment; using the key from ${env.T3IH_INSTABOX_API_KEY ? "T3IH_INSTABOX_API_KEY" : "secrets.env"} (they differ)`);
+  }
+  if (chosen) secrets.INSTABOX_API_KEY = chosen;
+  delete secrets.T3IH_INSTABOX_API_KEY;
   return secrets;
 }
 
@@ -98,6 +116,7 @@ export function loadState(dir = home()): State {
 export function saveState(s: State, dir = home()) {
   const f = join(dir, "state.json");
   writeFileSync(`${f}.tmp`, `${JSON.stringify(s, null, 2)}\n`, { mode: 0o600 });
+  chmodSync(`${f}.tmp`, 0o600);
   renameSync(`${f}.tmp`, f);
 }
 
