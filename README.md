@@ -59,6 +59,8 @@ box: t3 serve --host 127.0.0.1 --port 3774   (template unit + this helper's drop
   runs again. Before reopening, it closes stale outbound HTTP(S) connections
   (bb saw agents hang on them after a pause), and it re-runs setup when the box
   was stopped (a stop wipes the tmpfs key file).
+- **Modes.** See [Two modes](#two-modes): per-machine (implemented) and
+  hub-only through peer links (documented only).
 - **Wake on use.** See [Wake on use](#wake-on-use). A paused or stopped box
   wakes when a client opens a session on its route, not when a client only
   checks the route.
@@ -67,6 +69,98 @@ box: t3 serve --host 127.0.0.1 --port 3774   (template unit + this helper's drop
   Polling is cheap: one `GET /v1/machines/{id}` per box per interval, which
   does not wake the box. Webhooks could be added later as an optional trigger
   through a Tailscale Funnel or another public endpoint; nothing depends on them.
+
+## Two modes
+
+### Per-machine mode (supported, implemented)
+
+Each box is its own T3 environment on your devices, reached through the hub:
+
+```text
+phone → https://<hub>.<tailnet>.ts.net:<servePort>/   (tailscale serve, tailnet only)
+      → hub 127.0.0.1:<localPort>                       (t3ih watch: wake proxy)
+      → hub 127.0.0.1:<ephemeral> → ssh -L → box 127.0.0.1:3774   (box's own T3)
+```
+
+- **Pairing:** once per box per device. `t3ih pair <box>` mints a one-time
+  link on the box whose URL is the hub route; after that, the device
+  reconnects with its own session and needs no new link.
+- **Use:** you open the box's threads directly in T3 (web, desktop, phone),
+  with the box's terminal, files and browser tabs. With several boxes added,
+  T3's **Load balancing** can spread new threads across them.
+- **Wake on use:** a paused or stopped box wakes when a device opens a
+  session on its route (about 1.6 s from a pause, 9.5 s from a stop, measured).
+  Background route checks are answered by the hub and don't wake it. Details
+  in [Wake on use](#wake-on-use).
+- **Limits:** the hub sees connections, not T3 actions, so **any reconnect
+  wakes the box** (opening or focusing the app, a backoff retry), and **an
+  open app keeps a box awake**: a connected client pings every 5 s, and
+  InstaBox counts that as activity. Switch a box's environment off on a
+  device that should leave it asleep.
+
+### Hub-only mode (documented alternative, not implemented)
+
+Your devices pair only with the hub's own T3. The hub links to each box over
+the same tunnel with T3's **Linked environments** beta (peer links), and agents
+on the hub start and follow threads on the boxes.
+
+```text
+phone → hub's T3 (one environment) → hub agent → peer link
+      → hub 127.0.0.1:<localPort> (wake proxy) → ssh -L → box T3 /mcp
+```
+
+What it needs:
+
+- `linkedEnvironmentsEnabled` (**Settings → Labs**) on the hub and on every
+  box. On a headless box this has to be set some other way; not worked out.
+- One link per box, made on the hub with a pairing code minted on the box:
+  `t3 environment link http://127.0.0.1:<localPort> --pairing-code <token>
+  --access <read-only|approval-required|auto-accept-edits|auto|full-access>`.
+  The token is the `#token=` part of a `t3ih pair` link (made with
+  `tailscaleServe: false`, so no tailnet route is needed). `t3 environment` is
+  on T3 Code's main branch but **not in stable 0.1.3's CLI**; until it ships,
+  link from the hub's **Settings → Connections → Linked environments**.
+- Re-linking every 30 days (links expire).
+- `t3ih watch` still runs: it keeps the tunnel and wake proxy that the link
+  uses. No `tailscale serve` route per box.
+
+How work flows: you ask an agent on the hub, for example "run this on box1".
+It uses `delegate_task` (or the thread tools with the box as
+`environmentId`); the task runs on the box as an ordinary thread, marked
+**From** the hub, and the hub thread wakes with its result.
+
+Trade-offs:
+
+- **Beta dependency.** Peer links are behind a Labs flag and may change.
+- **Through the hub's agent.** You work through a hub thread, not in the
+  box's thread directly: no box terminal, files or browser tabs on your
+  devices, and the hub agent's mode caps what the box agent may do. Below
+  full access, linked work is fenced (it can change only threads the link
+  started and skips project setup scripts).
+- **Wake follows the hub's link.** The box wakes when the hub forwards a call
+  (each is a request to the box's `/mcp`, which the wake proxy treats as use),
+  and stays awake while a delegated task is followed (the hub waits in calls of
+  up to 50 s). It can pause once no task is running, whether or not your apps
+  are open. Descriptor checks before each call are answered from the hub's
+  cache. That is better for idle pause than per-machine mode, but untested.
+- **Fewer pairings.** One pairing per device (the hub) instead of one per box
+  per device, and no tailnet port per box.
+
+Why per-machine is the default today: it uses only stable T3 features, gives
+direct access to each box's threads and tools, and is the mode this helper
+implements and tested live. Hub-only needs a beta on every box, a CLI command
+not yet in a stable release, and an agent in the middle of every action.
+
+| | Per-machine (default) | Hub-only (not built) |
+|---|---|---|
+| Status | Implemented, live-tested | Documented only |
+| T3 features | Stable (pairing) | Linked environments beta, `t3 environment` (not in 0.1.3) |
+| Pairing | Once per box per device | Once per device (hub) + one link per box on the hub, renewed every 30 days |
+| Tailnet ports | One per box | None per box |
+| How you work | Directly in the box's threads, terminal, files | Through a hub agent that delegates to the box |
+| Box wakes when | Any device opens a session to it | The hub forwards a call to it |
+| Box stays awake while | Any device stays connected | A delegated task is being followed |
+| Access control | Each device's own session on the box | The link's access level, capped by the hub agent's mode |
 
 ## Why TypeScript on plain Node, with no runtime dependencies
 
@@ -331,18 +425,6 @@ waking, running and error states:
    the fallback. This improves 1 and 2; it is not a UI by itself.
 
 Recommended order: 1, then 3 if poll latency matters, then 2.
-
-## Alternative: one route only, through peer links
-
-Instead of a route per box, you can connect only to the hub's own T3 and let
-the hub's agents drive the boxes through T3's **Linked environments** beta
-(`linkedEnvironmentsEnabled`, on both sides). For each box, run
-`t3 environment link http://127.0.0.1:<localPort> --pairing-code <code>
---access <mode>` on the hub, with a pairing code minted on that box (for
-example with `t3 auth pairing create` through `t3ih`'s exec path; untested). Agents then use `delegate_task` to run work on a box.
-No tailnet ports, no per-device pairing. But you only see the boxes' threads
-through the hub's agents, links last 30 days, and it is a beta. Not built
-here; the route-per-box mode is the supported one.
 
 ## Tests
 
