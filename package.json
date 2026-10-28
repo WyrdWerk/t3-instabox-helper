@@ -1,0 +1,22 @@
+{
+  "name": "t3-instabox-helper",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "InstaBox machines as T3 Code environments, reached only through an always-on hub (ssh -L + tailnet-only tailscale serve). Experimental.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "bin": {
+    "t3ih": "./bin/t3ih"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "typecheck": "tsc --noEmit -p ."
+  }
+}
